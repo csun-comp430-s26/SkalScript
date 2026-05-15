@@ -11,6 +11,7 @@ module.exports = {
   collectCoverageFrom: [
     "src/lexer/**/*.ts",
     "src/parser/**/*.ts",
+    "src/typechecker/**/*.ts",
     "!src/**/*.d.ts"
   ],
   coverageReporters: ["text", "lcov", "html"]

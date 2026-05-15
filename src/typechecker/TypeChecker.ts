@@ -8,6 +8,7 @@ import {
   AlgebraicType,
   FunctionType,
   Pattern,
+  Param,
   AlgDef,
   FuncDef,
 } from "../parser/AST"
@@ -93,6 +94,24 @@ export class TypeChecker {
       }
     }
 
+    /// VALIDATE ADT CONSTRUCTOR PARAMETER TYPES ///
+    // Separate pass: a constructor may reference an ADT that is
+    // declared later in the program, so every ADT must be registered
+    // before any constructor parameter type can be validated.
+    for (const adt of p.algDefs) {
+
+      const savedTypeVars = this.env.typeVars
+      this.env.typeVars = new Set(adt.typeParams)
+
+      for (const ctor of adt.constructors) {
+        for (const paramType of ctor.params) {
+          this.validateType(paramType)
+        }
+      }
+
+      this.env.typeVars = savedTypeVars
+    }
+
     /// REGISTER FUNCTIONS ///
     for (const fn of p.funcDefs) {
 
@@ -103,6 +122,12 @@ export class TypeChecker {
 
       if (this.env.funcs.has(fn.name)) {
         throw new Error(`Duplicate function: ${fn.name}`)
+      }
+
+      if (this.env.constructors.has(fn.name)) {
+        throw new Error(
+          `Function ${fn.name} conflicts with a constructor of the same name`
+        )
       }
 
       this.env.funcs.set(
@@ -148,6 +173,8 @@ export class TypeChecker {
       this.env.typeVars.add(tp)
     })
 
+    this.ensureUniqueParamNames(fn.params, `function ${fn.name}`)
+
     for (const p of fn.params) {
 
       this.validateType(p.type)
@@ -191,10 +218,26 @@ export class TypeChecker {
         if (v) return v.type
 
         const f = this.env.funcs.get(e.name)
-        if (f) return f.fn
+        if (f) {
+          if (f.typeParams.length > 0) {
+            throw new Error(
+              `Generic function ${e.name} cannot be used as a value; ` +
+              `call it with explicit type arguments`
+            )
+          }
+          return f.fn
+        }
 
         const c = this.env.constructors.get(e.name)
-        if (c) return c.fn
+        if (c) {
+          if (c.typeParams.length > 0) {
+            throw new Error(
+              `Generic constructor ${e.name} cannot be used as a value; ` +
+              `call it with explicit type arguments`
+            )
+          }
+          return c.fn
+        }
 
         throw new Error(`Unknown identifier: ${e.name}`)
       }
@@ -234,7 +277,12 @@ export class TypeChecker {
 
         let poly: PolyFunction | null = null
 
-        if (e.callee.kind === "Identifier") {
+        // Only resolve to a named function/constructor when the callee
+        // is not shadowed by a local variable.
+        if (
+          e.callee.kind === "Identifier" &&
+          !this.env.vars.has(e.callee.name)
+        ) {
           poly =
             this.env.funcs.get(e.callee.name) ??
             this.env.constructors.get(e.callee.name) ??
@@ -246,7 +294,9 @@ export class TypeChecker {
           const t = this.typeOf(e.callee)
 
           if (t.kind !== "FunctionType") {
-            throw new Error("Attempted to call non-function")
+            throw new Error(
+              `Attempted to call non-function of type ${this.showType(t)}`
+            )
           }
 
           if (e.typeArgs.length > 0) {
@@ -286,6 +336,8 @@ export class TypeChecker {
       case "LambdaExpression": {
 
         const saved = new Map(this.env.vars)
+
+        this.ensureUniqueParamNames(e.params, `lambda`)
 
         for (const p of e.params) {
           this.validateType(p.type)
@@ -348,11 +400,14 @@ export class TypeChecker {
           throw new Error("Empty match expression")
         }
 
+        this.checkExhaustive(subject, e.cases)
+
         return result
       }
     }
 
-    throw new Error("Unreachable expression")
+    const _exhaustive: never = e
+    throw new Error(`Unhandled expression kind: ${(_exhaustive as Expression).kind}`)
   }
 
   /// CALLS ///
@@ -487,6 +542,236 @@ export class TypeChecker {
     }
   }
 
+  /// PATTERN EXHAUSTIVITY ///
+
+  // Verifies that the cases of a match expression cover every possible value of the subject type.
+  private checkExhaustive(
+    subjectType: Type,
+    cases: { pattern: Pattern }[]
+  ): void {
+
+    const matrix = cases.map(c => [c.pattern])
+
+    const witness = this.exhaustivenessWitness(matrix, [subjectType])
+
+    if (witness) {
+      throw new Error(
+        `Non-exhaustive match: no case covers ${this.showPattern(witness[0])}`
+      )
+    }
+  }
+
+  // Simplified Maranget-style witness search for the all-wildcard query vector.
+  private exhaustivenessWitness(
+    matrix: Pattern[][],
+    colTypes: Type[]
+  ): Pattern[] | null {
+
+    // No columns left: covered iff a row remains.
+    if (colTypes.length === 0) {
+      return matrix.length === 0 ? [] : null
+    }
+
+    const headType = colTypes[0]
+    const restTypes = colTypes.slice(1)
+    const sigma = this.headConstructors(matrix)
+
+    // Complete ADT column: recurse under each constructor.
+    if (headType.kind === "AlgebraicType") {
+
+      const allConstructors = this.constructorsForAlgebraicType(headType)
+      const complete = allConstructors.every(c => sigma.has(c.name))
+
+      if (complete) {
+
+        for (const ctor of allConstructors) {
+
+          const fieldTypes = this.constructorFieldTypes(
+            ctor.name,
+            headType
+          )
+
+          const subWitness = this.exhaustivenessWitness(
+            this.specializeMatrix(ctor.name, fieldTypes.length, matrix),
+            fieldTypes.concat(restTypes)
+          )
+
+          if (subWitness) {
+            // Rewrap the constructor fields around the sub-witness.
+            return [
+              {
+                kind: "ConstructorPattern",
+                constructorName: ctor.name,
+                args: subWitness.slice(0, fieldTypes.length)
+              },
+              ...subWitness.slice(fieldTypes.length)
+            ]
+          }
+        }
+
+        return null
+      }
+    }
+
+    // Otherwise, only wildcard or variable rows can cover this column.
+    const subWitness = this.exhaustivenessWitness(
+      this.defaultMatrix(matrix),
+      restTypes
+    )
+
+    if (!subWitness) {
+      return null
+    }
+
+    // Rebuild the dropped column.
+    if (headType.kind === "AlgebraicType" && sigma.size > 0) {
+
+      const missing = this
+        .constructorsForAlgebraicType(headType)
+        .find(c => !sigma.has(c.name))
+
+      if (missing) {
+        const arity = this.constructorFieldTypes(
+          missing.name,
+          headType
+        ).length
+
+        return [
+          {
+            kind: "ConstructorPattern",
+            constructorName: missing.name,
+            args: this.wildcards(arity)
+          },
+          ...subWitness
+        ]
+      }
+    }
+
+    // Any value works for this column.
+    return [{ kind: "WildcardPattern" }, ...subWitness]
+  }
+
+  // Constructors in column 0.
+  private headConstructors(matrix: Pattern[][]): Set<string> {
+
+    const result = new Set<string>()
+
+    for (const row of matrix) {
+      const head = row[0]
+      if (head.kind === "ConstructorPattern") {
+        result.add(head.constructorName)
+      }
+    }
+
+    return result
+  }
+
+  // Specialize the matrix for a constructor.
+  private specializeMatrix(
+    ctorName: string,
+    arity: number,
+    matrix: Pattern[][]
+  ): Pattern[][] {
+
+    const result: Pattern[][] = []
+
+    for (const row of matrix) {
+      const head = row[0]
+      const tail = row.slice(1)
+
+      if (head.kind === "ConstructorPattern") {
+        if (head.constructorName === ctorName) {
+          result.push(head.args.concat(tail))
+        }
+      } else {
+        result.push(this.wildcards(arity).concat(tail))
+      }
+    }
+
+    return result
+  }
+
+  // Drop column 0 for wildcard and variable rows.
+  private defaultMatrix(matrix: Pattern[][]): Pattern[][] {
+
+    const result: Pattern[][] = []
+
+    for (const row of matrix) {
+      const head = row[0]
+      if (
+        head.kind === "WildcardPattern" ||
+        head.kind === "VariablePattern"
+      ) {
+        result.push(row.slice(1))
+      }
+    }
+
+    return result
+  }
+
+  // Constructor field types after substituting the ADT type arguments.
+  private constructorFieldTypes(
+    ctorName: string,
+    algType: AlgebraicType
+  ): Type[] {
+
+    const poly = this.env.constructors.get(ctorName)
+
+    if (!poly) {
+      throw new Error(`Unknown constructor: ${ctorName}`)
+    }
+
+    const subst = new Map<string, Type>()
+
+    this.unify(poly.fn.returnType, algType, subst)
+
+    return poly.fn.paramTypes.map(t => this.substituteType(t, subst))
+  }
+
+  // All constructors declared for an algebraic data type.
+  private constructorsForAlgebraicType(
+    algType: AlgebraicType
+  ): AlgDef["constructors"] {
+
+    const adt = this.env.adts.get(algType.name)
+
+    if (!adt) {
+      throw new Error(`Internal error: unknown ADT ${algType.name}`)
+    }
+
+    return adt.constructors
+  }
+
+  // A vector of n wildcard patterns.
+  private wildcards(n: number): Pattern[] {
+
+    const result: Pattern[] = []
+
+    for (let i = 0; i < n; i++) {
+      result.push({ kind: "WildcardPattern" })
+    }
+
+    return result
+  }
+
+  // Renders a pattern for a non-exhaustive match error message.
+  private showPattern(p: Pattern): string {
+
+    switch (p.kind) {
+
+      case "WildcardPattern":
+        return "_"
+
+      case "VariablePattern":
+        return p.name
+
+      case "ConstructorPattern":
+        return `${p.constructorName}(${p.args
+          .map(a => this.showPattern(a))
+          .join(", ")})`
+    }
+  }
+
   /// TYPE VALIDATION ///
   private validateType(t: Type): void {
 
@@ -538,6 +823,19 @@ export class TypeChecker {
         throw new Error(`Duplicate type parameter ${p} in ${context}`)
       }
       seen.add(p)
+    }
+  }
+
+  // Reject duplicate names in one parameter list.
+  private ensureUniqueParamNames(params: Param[], context: string): void {
+
+    const seen = new Set<string>()
+
+    for (const p of params) {
+      if (seen.has(p.name)) {
+        throw new Error(`Duplicate parameter name ${p.name} in ${context}`)
+      }
+      seen.add(p.name)
     }
   }
 
