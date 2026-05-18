@@ -12,7 +12,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/main.ts",
+    "dev": "ts-node src/index.ts",
     "test": "jest",
     "coverage": "jest --coverage"
   }
